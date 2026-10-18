@@ -368,6 +368,202 @@ function normalizeCredits(value) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// amounts
+
+function groupThousands(digits) {
+  var out = "";
+  var seen = 0;
+  for (var i = digits.length - 1; i >= 0; i--) {
+    out = digits.charAt(i) + out;
+    seen++;
+    if (seen % 3 === 0 && i > 0) out = "," + out;
+  }
+  return out;
+}
+
+function fixed(value, places) {
+  return Number(value).toFixed(places);
+}
+
+// Full number with thousands separators, matching what the console prints:
+// `12,345.67` and `1,250.50` keep both decimals, while a whole amount drops
+// them entirely (`12,345`).
+function exactAmount(magnitude) {
+  if (!isFinite(magnitude)) return "\u2014";
+  // Past 1e21 a JavaScript number prints as "1e+21", so the digit grouping
+  // below would have nothing to group. A credit balance that large is absurd,
+  // but the bar must still print a number rather than an exponent. The test is
+  // on the input: rounding it first would push 1e21 down below the threshold.
+  if (magnitude >= 1e21) return groupThousands(BigInt(Math.round(magnitude)).toString());
+  var rounded = Math.round(magnitude * 100) / 100;
+  if (rounded % 1 === 0) return groupThousands(String(rounded));
+  var integral = Math.floor(rounded);
+  var fraction = fixed(rounded - integral, 2).slice(2);
+  return groupThousands(String(integral)) + "." + fraction;
+}
+
+// Three significant figures inside the chosen unit: `12.3k` and `1.50L` keep
+// the digits that distinguish balances while still fitting several currencies
+// in one bar label. `L` and `Cr` are the unit Indian billing actually prints;
+// everything else shortens to `k` and `M`.
+function significant3(quotient) {
+  var places = quotient >= 100 ? 0 : quotient >= 10 ? 1 : 2;
+  var out = fixed(quotient, places);
+  // Rounding can carry into an extra digit (9.999 -> "10.00"); step down one
+  // place so the result still reads as three significant figures.
+  if (places === 2 && Number(out) >= 10) out = fixed(quotient, 1);
+  if (places >= 1 && Number(out) >= 100) out = fixed(quotient, 0);
+  return out;
+}
+
+function compactAmount(magnitude, currency) {
+  var code = text(currency).toUpperCase();
+  // The unit ladder stops once a unit would need more than three digits before
+  // it: past that the exact grouped number is both shorter and unambiguous.
+  if (code === "INR") {
+    if (magnitude >= 1e15) return exactAmount(magnitude);
+    if (magnitude >= 1e12) return significant3(magnitude / 1e12) + "L Cr";
+    if (magnitude >= 10000000) return significant3(magnitude / 10000000) + "Cr";
+    if (magnitude >= 100000) return significant3(magnitude / 100000) + "L";
+  } else {
+    if (magnitude >= 1e15) return exactAmount(magnitude);
+    if (magnitude >= 1e12) return significant3(magnitude / 1e12) + "T";
+    if (magnitude >= 1e9) return significant3(magnitude / 1e9) + "B";
+    if (magnitude >= 1000000) return significant3(magnitude / 1000000) + "M";
+  }
+  if (magnitude >= 1000) return significant3(magnitude / 1000) + "k";
+  // Below the smallest unit both modes are the same number.
+  return exactAmount(magnitude);
+}
+
+// amount only, no currency: the callers below put the code in front of it.
+function formatAmount(value, currency, mode) {
+  var amount = Number(value);
+  if (!isFinite(amount)) return "\u2014";
+  var magnitude = Math.abs(amount);
+  var body =
+    text(mode) === "exact"
+      ? exactAmount(magnitude)
+      : compactAmount(magnitude, currency);
+  return (amount < 0 ? "-" : "") + body;
+}
+
+// "INR 12.3k" / "INR 12,345"
+function amountWithCurrency(value, currency, mode) {
+  var code = text(currency);
+  var amount = formatAmount(value, code, mode);
+  return code === "" ? amount : code + " " + amount;
+}
+
+function plural(count, one, many) {
+  return count === 1 ? one : many;
+}
+
+// ---------------------------------------------------------------------------
+// what the bar shows
+
+// Up to `limit` currencies that still have funds, in the helper's usable-first
+// order. Currencies that are spent out are left out: the point of the label is
+// what is still there to spend.
+function usableLabels(view, limit, mode) {
+  var out = [];
+  var totals = isArray(view && view.totals) ? view.totals : [];
+  var cap = Math.floor(numberOr(limit, 2));
+  for (var i = 0; i < totals.length && out.length < cap; i++) {
+    var usable = Number(totals[i] && totals[i].usable);
+    if (!isFinite(usable) || usable <= 0) continue;
+    out.push(amountWithCurrency(usable, totals[i].currency, mode));
+  }
+  return out;
+}
+
+function barLabel(view, mode) {
+  if (!view || view.ok !== true) return "";
+  var parts = usableLabels(view, 2, mode);
+  if (parts.length > 0) return parts.join(" \u00b7 ");
+  // Nothing usable anywhere: name the primary currency at zero rather than
+  // dropping off the bar, because the panel is how it gets refreshed.
+  var primary = text(view.primaryCurrency);
+  if (primary === "" && isArray(view.totals) && view.totals.length > 0)
+    primary = text(view.totals[0].currency);
+  if (primary === "") return "GCP";
+  return amountWithCurrency(numberOr(view.totalUsable, 0), primary, mode);
+}
+
+function warningMarker() {
+  return WARNING_MARKER;
+}
+
+// ---------------------------------------------------------------------------
+// what the tooltip shows
+
+function ageText(fetchedAt, nowMs) {
+  var when = Date.parse(text(fetchedAt));
+  if (!isFinite(when)) return "unknown";
+  var now = Number(nowMs);
+  if (!isFinite(now)) now = Date.now();
+  var seconds = Math.round((now - when) / 1000);
+  // A snapshot stamped in the future is a clock difference, not a prediction.
+  if (seconds < 0) seconds = 0;
+  if (seconds < 60) return "just now";
+  var minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + (minutes === 1 ? " minute ago" : " minutes ago");
+  var hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + (hours === 1 ? " hour ago" : " hours ago");
+  var days = Math.floor(hours / 24);
+  return days + (days === 1 ? " day ago" : " days ago");
+}
+
+function tooltip(view, mode, nowMs) {
+  var state = view || loadingView();
+  var lines = [];
+  if (state.ok === true) {
+    var label = barLabel(state, mode);
+    lines.push("GCP Credits: " + (label === "" ? "no usable funds" : label));
+    if (state.billingAccount !== "")
+      lines.push("Billing account " + state.billingAccount);
+    lines.push("Snapshot taken " + ageText(state.fetchedAt, nowMs));
+  } else if (state.loading === true) {
+    lines.push("GCP Credits: no snapshot read yet");
+    lines.push("Snapshot file " + CACHE_RELATIVE_PATH);
+  } else {
+    lines.push(
+      "GCP Credits: " + (state.error === "" ? "fetch failed" : clampText(state.error, MAX_TOOLTIP_CHARS)),
+    );
+    if (state.code !== "") lines.push("code: " + state.code);
+    if (state.hint !== "") lines.push("hint: " + clampText(state.hint, MAX_TOOLTIP_CHARS));
+    if (state.fetchedAt !== "")
+      lines.push("Snapshot taken " + ageText(state.fetchedAt, nowMs));
+  }
+  lines.push(
+    "Click for the panel \u00b7 middle-click to refresh \u00b7 right-click to open the billing console",
+  );
+  return lines.join("\n");
+}
+
+// One line for the shell log, so a failed fetch is visible without the panel.
+function statusLine(view, mode, nowMs) {
+  var state = view || loadingView();
+  if (state.loading === true) return "no snapshot read yet";
+  if (state.ok !== true)
+    return (
+      "not ok" +
+      (state.code === "" ? "" : " (" + state.code + ")") +
+      (state.error === "" ? "" : ": " + state.error)
+    );
+  var label = barLabel(state, mode);
+  return (
+    (label === "" ? "no usable funds" : label) +
+    ", " +
+    state.credits.length +
+    " " +
+    plural(state.credits.length, "credit", "credits") +
+    ", snapshot " +
+    ageText(state.fetchedAt, nowMs)
+  );
+}
+
 
 if (typeof module !== "undefined") {
   module.exports = {
@@ -404,5 +600,15 @@ if (typeof module !== "undefined") {
     fetchFailureText: fetchFailureText,
     normalizeTotals: normalizeTotals,
     normalizeCredits: normalizeCredits,
+    groupThousands: groupThousands,
+    formatAmount: formatAmount,
+    amountWithCurrency: amountWithCurrency,
+    plural: plural,
+    usableLabels: usableLabels,
+    barLabel: barLabel,
+    warningMarker: warningMarker,
+    ageText: ageText,
+    tooltip: tooltip,
+    statusLine: statusLine,
   };
 }
