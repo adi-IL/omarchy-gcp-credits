@@ -346,6 +346,320 @@ function profileState() {
 }
 
 // ---------------------------------------------------------------------------
+// CDP over the debug pipe
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Chromium writes protocol messages to fd 4 and reads them from fd 3, each one
+// a JSON object terminated by a NUL byte. Nothing but this process and its
+// child can reach the channel, and it dies with them.
+function pipeClient(child, defaultTimeoutMs = 30000) {
+  const pending = new Map();
+  let nextId = 0;
+  let buffer = Buffer.alloc(0);
+  const answers = child.stdio[4];
+
+  answers.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    let end;
+    while ((end = buffer.indexOf(0)) !== -1) {
+      const raw = buffer.subarray(0, end).toString("utf8");
+      buffer = buffer.subarray(end + 1);
+      let message = null;
+      try {
+        message = JSON.parse(raw);
+      } catch {
+        continue; // a log line Chromium wrote to the pipe; nothing to answer
+      }
+      const entry = pending.get(message.id);
+      if (!entry) continue;
+      pending.delete(message.id);
+      clearTimeout(entry.timer);
+      if (message.error) entry.reject(new Failure("query_rejected", message.error.message));
+      else entry.resolve(message.result);
+    }
+  });
+  // A browser that dies mid-command makes the write side fail asynchronously;
+  // the answer never arrives, so the request times out or the close handler
+  // rejects it. Handling the stream error keeps Node from crashing on it.
+  child.stdio[3].on("error", () => {});
+  answers.on("error", () => {});
+  answers.on("close", () => {
+    for (const [id, entry] of pending) {
+      pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.reject(new Failure("browser_failed", "Chromium closed the debug pipe", `See ${BROWSER_LOG}`));
+    }
+  });
+
+  const send = (method, params = {}, sessionId, timeoutMs = defaultTimeoutMs) =>
+    new Promise((resolve, reject) => {
+      const id = ++nextId;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(
+          new Failure(
+            "browser_failed",
+            `Chromium did not answer ${method} within ${Math.round(timeoutMs / 1000)} seconds`,
+            `See ${BROWSER_LOG}`,
+          ),
+        );
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timer });
+      child.stdio[3].write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0");
+    });
+
+  return {
+    send,
+    close() {
+      for (const [id, entry] of pending) {
+        pending.delete(id);
+        clearTimeout(entry.timer);
+      }
+      child.stdio[3].destroy();
+      answers.destroy();
+    },
+  };
+}
+
+async function launchBrowser() {
+  assertChromium();
+  ensureProfileFree();
+  clearSingletons();
+  const logFd = openBrowserLog();
+  const child = spawn(CHROMIUM, [...CHROMIUM_PIPE_ARGS, "--headless=new", `${ORIGIN}/`], {
+    // fd 3 and 4 are the debug pipe. The child gets its own process group so
+    // `stopBrowser` can bring the whole browser - zygote, renderers, utility
+    // processes - down with one signal.
+    stdio: ["ignore", logFd, logFd, "pipe", "pipe"],
+    detached: true,
+  });
+  child.unref();
+  // A browser that cannot be spawned emits `error` here; the pipe client has
+  // nothing to answer with, so the request fails on its own timeout.
+  child.on("error", () => {});
+  const cdp = pipeClient(child);
+  try {
+    // Commands written before Chromium is up wait in the pipe, so the first
+    // answer doubles as the startup check. A binary that cannot be executed -
+    // swallowed by the handler above - rejects this instead of waiting out the
+    // whole timeout.
+    await Promise.race([
+      cdp.send("Browser.getVersion", {}, undefined, REQUEST_TIMEOUT_MS),
+      new Promise((_, reject) =>
+        child.once("error", (error) =>
+          reject(new Failure("browser_failed", `Chromium did not start: ${error.message}`, `See ${BROWSER_LOG}`)),
+        ),
+      ),
+    ]);
+    return { child, cdp };
+  } catch (error) {
+    cdp.close();
+    await stopBrowser(child);
+    throw error instanceof Failure
+      ? error
+      : new Failure("browser_failed", `Chromium did not start: ${error.message}`, `See ${BROWSER_LOG}`);
+  }
+}
+
+async function stopBrowser(child) {
+  if (!child || child.exitCode !== null) return;
+  const signal = (name) => {
+    try {
+      process.kill(-child.pid, name);
+    } catch {
+      try {
+        child.kill(name);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+  signal("SIGTERM");
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || !fs.existsSync(`/proc/${child.pid}`)) return;
+    await sleep(120);
+  }
+  signal("SIGKILL");
+}
+
+function openBrowserLog() {
+  ensurePrivateDir(STATE_DIR);
+  try {
+    fs.chmodSync(BROWSER_LOG, 0o600);
+  } catch {
+    /* not created yet */
+  }
+  return fs.openSync(BROWSER_LOG, "w", 0o600);
+}
+
+// The browser of the fetch that is running, so a signal can take it down: a
+// headless Chromium left behind would hold the cloned profile - and the signed
+// in session - until the user noticed it.
+let activeBrowser = null;
+
+async function shutdown(code) {
+  const browser = activeBrowser;
+  activeBrowser = null;
+  if (browser) await stopBrowser(browser.child);
+  releaseLock();
+  process.exit(code);
+}
+
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+]) {
+  process.on(signal, () => {
+    void shutdown(code);
+  });
+}
+
+// Last resort for an exit that is not a signal: never orphan the browser.
+process.on("exit", () => {
+  if (!activeBrowser) return;
+  try {
+    process.kill(-activeBrowser.child.pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+});
+
+// ---------------------------------------------------------------------------
+// console access
+
+async function consolePage(cdp) {
+  const { targetInfos } = await cdp.send("Target.getTargets");
+  const existing = targetInfos.find((t) => t.type === "page" && t.url.startsWith(ORIGIN));
+  const targetId = existing
+    ? existing.targetId
+    : (await cdp.send("Target.createTarget", { url: `${ORIGIN}/`, background: true })).targetId;
+  const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+
+  const deadline = Date.now() + 40000;
+  while (Date.now() < deadline) {
+    const probe = await cdp
+      .send(
+        "Runtime.evaluate",
+        {
+          expression: "JSON.stringify({origin: location.origin, cookie: document.cookie.includes('SAPISID')})",
+          returnByValue: true,
+        },
+        sessionId,
+      )
+      .catch(() => null);
+    const value = probe?.result?.value ? JSON.parse(probe.result.value) : null;
+    if (value?.origin === ORIGIN && value.cookie) return { sessionId, targetId, created: !existing };
+    await sleep(500);
+  }
+  throw new Failure(
+    "auth_required",
+    "The cloned browser profile is not signed in to Google Cloud",
+    "Run `gcp-credits login` and sign in, or `gcp-credits setup` to re-clone your Chromium profile",
+  );
+}
+
+// One credits query exactly as the console page makes it: the session cookie
+// signs the request with SAPISIDHASH, and `authUser` names which Google account
+// in this profile answers.
+async function creditsRequest(cdp, sessionId, billingAccount, authUser) {
+  const body = JSON.stringify({ ...LIST_CREDITS_BODY, variables: { name: `billingAccounts/${billingAccount}` } });
+  const expression = `
+    (async () => {
+      const cookies = Object.fromEntries(document.cookie.split('; ').map(c => {
+        const i = c.indexOf('='); return [c.slice(0, i), c.slice(i + 1)];
+      }));
+      const sapisid = cookies['SAPISID'];
+      if (!sapisid) return JSON.stringify({ transport: 'no_sapisid' });
+      const ts = Math.floor(Date.now() / 1000);
+      const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(ts + ' ' + sapisid + ' ${ORIGIN}'));
+      const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+      // The page owns the deadline: a Google endpoint that accepts the
+      // connection and then stalls must not hold the helper - and its browser -
+      // open until something kills them.
+      let response;
+      try {
+        response = await fetch(${JSON.stringify(CREDITS_URL)}, {
+          method: 'POST',
+          credentials: 'include',
+          signal: AbortSignal.timeout(${REQUEST_TIMEOUT_MS}),
+          headers: {
+            'content-type': 'application/json',
+            authorization: 'SAPISIDHASH ' + ts + '_' + hash,
+            'x-goog-authuser': '${authUser}',
+          },
+          body: ${JSON.stringify(body)},
+        });
+      } catch (error) {
+        return JSON.stringify({ transport: 'failed', message: String((error && error.message) || error) });
+      }
+      return JSON.stringify({ transport: 'http', status: response.status, text: await response.text() });
+    })()`;
+  const out = await cdp.send(
+    "Runtime.evaluate",
+    { expression, awaitPromise: true, returnByValue: true },
+    sessionId,
+    REQUEST_TIMEOUT_MS + 15000,
+  );
+  const raw = out?.result?.value;
+  if (typeof raw !== "string") {
+    const detail = out?.exceptionDetails?.exception?.description || "no value returned";
+    throw new Failure("browser_failed", `The console page answered nothing: ${String(detail).slice(0, 200)}`, null);
+  }
+  const result = JSON.parse(raw);
+  if (result.transport === "no_sapisid")
+    throw new Failure("auth_required", "The console page has no SAPISID cookie", "Run `gcp-credits login`");
+  if (result.transport === "failed")
+    throw new Failure(
+      "network_error",
+      `The credits request failed: ${String(result.message).slice(0, 200)}`,
+      "Check this machine's network, then let the next refresh run",
+    );
+  if (result.status !== 200) {
+    const detail = result.text.slice(0, 300).replace(/\s+/g, " ");
+    throw new Failure(
+      result.status === 401 || result.status === 403 ? "auth_required" : "http_error",
+      `credits request failed with HTTP ${result.status}: ${detail}`,
+      "Run `gcp-credits login` if the browser session expired",
+    );
+  }
+  return JSON.parse(result.text);
+}
+
+// A Chromium profile usually holds more than one Google account, and the API
+// answers for the account the `authuser` index names. A billing account only
+// answers for the account that owns it, and every other index is refused with a
+// permission error, so the index is found by asking. That is what keeps this
+// working after `setup` re-clones a profile whose useful account is not first.
+async function fetchCredits(cdp, sessionId, billingAccount) {
+  let denied = "";
+  for (const authUser of [0, 1, 2, 3]) {
+    const payload = await creditsRequest(cdp, sessionId, billingAccount, authUser);
+    const entry = payload[0]?.results?.[0];
+    if (entry?.errors?.length) {
+      const message = entry.errors.map((e) => e.message).join("; ").slice(0, 300);
+      // Only a permission answer means "wrong account"; anything else is the
+      // query itself being refused and must not be retried.
+      if (!/permission|forbidden|unauthor/i.test(message)) {
+        throw new Failure(
+          "query_rejected",
+          `The console rejected the credits query: ${message}`,
+          "The stored query signature probably changed; re-capture it from the billing credits page",
+        );
+      }
+      denied = message;
+      continue;
+    }
+    return { credits: entry?.data?.creditsQuery?.listCredits?.data ?? null, authUser };
+  }
+  throw new Failure(
+    "query_rejected",
+    `No Google account signed in to the cloned profile can read this billing account: ${denied}`,
+    "Run `gcp-credits login` and sign in with the account that owns the billing account",
+  );
+}
+
 // ---------------------------------------------------------------------------
 // billing account
 
@@ -441,6 +755,40 @@ function releaseLock() {
 // ---------------------------------------------------------------------------
 // commands
 
+async function cmdFetch(args) {
+  if (!profileState().present) {
+    throw new Failure("setup_required", "No cloned browser profile yet", "Run `gcp-credits setup` once");
+  }
+  // Only a fetch that won the lock releases it, so the acquisition stays out of
+  // the try: everything after it runs with the lock held and releases it on
+  // every path, including a bad account id and a browser that never starts.
+  acquireLock();
+  try {
+    const account = resolveBillingAccount(args);
+    const browser = await launchBrowser();
+    activeBrowser = browser;
+    try {
+      const page = await consolePage(browser.cdp);
+      const fetched = await fetchCredits(browser.cdp, page.sessionId, account);
+      if (!fetched.credits) throw new Failure("empty_response", "The console returned no credit rows", null);
+      const fetchedAt = new Date().toISOString();
+      const rank = { available: 0, future: 1, expired: 2, used: 3 };
+      const credits = fetched.credits
+        .map(toCredit)
+        .sort((a, b) => rank[a.state] - rank[b.state] || b.remaining - a.remaining);
+      const result = snapshot(credits, account, fetchedAt, fetched.authUser);
+      writeAtomic(CACHE_FILE, JSON.stringify(result, null, 2));
+      return result;
+    } finally {
+      activeBrowser = null;
+      browser.cdp.close();
+      await stopBrowser(browser.child);
+    }
+  } finally {
+    releaseLock();
+  }
+}
+
 function cmdLogin() {
   if (!profileState().present) {
     throw new Failure("setup_required", "No cloned browser profile yet", "Run `gcp-credits setup` once");
@@ -485,7 +833,8 @@ function cmdDoctor() {
   };
 }
 
-const COMMANDS = { setup: cmdSetup, login: cmdLogin, doctor: cmdDoctor };
+const COMMANDS = { setup: cmdSetup, fetch: cmdFetch, login: cmdLogin, doctor: cmdDoctor };
+
 function parseArgs(argv) {
   const [name, ...rest] = argv;
   const args = {};
