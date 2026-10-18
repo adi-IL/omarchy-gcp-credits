@@ -564,6 +564,193 @@ function statusLine(view, mode, nowMs) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// what the panel shows
+
+function heroMeta(view) {
+  var state = view || loadingView();
+  if (state.billingAccount !== "") return state.billingAccount;
+  if (state.loading === true) return "reading the snapshot";
+  return "unknown billing account";
+}
+
+function heroDetail(view) {
+  var state = view || loadingView();
+  if (state.loading === true) return "";
+  return ageText(state.fetchedAt, Date.now());
+}
+
+// One line per currency: everything the totals line carries, in the same order
+// the helper sorted them.
+function summaryLine(total, mode) {
+  if (!total) return "";
+  var code = text(total.currency);
+  var count = countOr(total.count);
+  return (
+    amountWithCurrency(total.usable, code, mode) +
+    " usable \u00b7 " +
+    formatAmount(total.remaining, code, mode) +
+    " remaining \u00b7 " +
+    formatAmount(total.original, code, mode) +
+    " issued \u00b7 " +
+    count +
+    " " +
+    plural(count, "credit", "credits")
+  );
+}
+
+function creditTitle(credit) {
+  var name = credit ? text(credit.displayName) : "";
+  return name === "" ? "Unnamed credit" : name;
+}
+
+function creditStateLabel(state) {
+  var raw = text(state);
+  if (raw === "available") return "Available";
+  if (raw === "future") return "Future";
+  if (raw === "expired") return "Expired";
+  if (raw === "used") return "Used";
+  if (raw === "") return "Unknown";
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+// The two states that are over: expired by the clock, or spent out. They are
+// what the `expiredCredits` setting hides.
+function isSpentState(state) {
+  var raw = text(state);
+  return raw === "expired" || raw === "used";
+}
+
+function visibleCredits(credits, showSpent) {
+  var list = isArray(credits) ? credits : [];
+  if (showSpent) return list;
+  var out = [];
+  for (var i = 0; i < list.length; i++) {
+    if (!isSpentState(list[i] && list[i].state)) out.push(list[i]);
+  }
+  return out;
+}
+
+function hiddenCreditCount(credits, showSpent) {
+  var list = isArray(credits) ? credits : [];
+  return list.length - visibleCredits(list, showSpent).length;
+}
+
+function hiddenCreditsNote(count) {
+  var n = countOr(count);
+  if (n === 0) return "";
+  return (
+    n +
+    (n === 1 ? " expired or used credit hidden" : " expired or used credits hidden") +
+    " \u00b7 set Expired and used credits to Show"
+  );
+}
+
+// The percent bar. The helper sends percentRemaining, but a snapshot that
+// omits it still draws from the two amounts rather than an empty bar.
+function percentRemaining(credit) {
+  var pct = Number(credit && credit.percentRemaining);
+  if (!isFinite(pct)) {
+    var remaining = Number(credit && credit.remaining);
+    var original = Number(credit && credit.original);
+    if (isFinite(remaining) && isFinite(original) && original > 0)
+      pct = (remaining / original) * 100;
+  }
+  if (!isFinite(pct)) return 0;
+  if (pct < 0) return 0;
+  if (pct > 100) return 100;
+  return pct;
+}
+
+function percentText(credit) {
+  return Math.round(percentRemaining(credit)) + "%";
+}
+
+// "1,250.50 of 5,000" - what is left of what was issued.
+function remainingText(credit, mode) {
+  if (!credit) return "";
+  return (
+    formatAmount(credit.remaining, credit.currency, mode) +
+    " of " +
+    formatAmount(credit.original, credit.currency, mode)
+  );
+}
+
+function pad2(value) {
+  var n = Math.floor(Number(value));
+  return (n < 10 ? "0" : "") + n;
+}
+
+// Local calendar date from the helper's ISO timestamp; "" when it is not one,
+// so a row can hide the line instead of printing Invalid Date.
+function formatDate(iso) {
+  var raw = text(iso);
+  if (raw === "") return "";
+  var when = new Date(raw);
+  if (!isFinite(when.getTime())) return "";
+  return when.getFullYear() + "-" + pad2(when.getMonth() + 1) + "-" + pad2(when.getDate());
+}
+
+function endText(credit, nowMs) {
+  var date = formatDate(credit && credit.end);
+  if (date === "") return "";
+  var when = new Date(text(credit.end)).getTime();
+  var now = Number(nowMs);
+  if (!isFinite(now)) now = Date.now();
+  var past = isFinite(when) && when < now;
+  return (past ? "ended " : "ends ") + date;
+}
+
+// The failed snapshot's error and hint, with a readable stand-in when the
+// helper sent neither (an empty cache, a killed fetch).
+function errorText(view) {
+  var state = view || loadingView();
+  if (state.error !== "") return state.error;
+  if (state.loading === true) return "No snapshot read yet.";
+  return "The snapshot is not usable.";
+}
+
+function errorHint(view) {
+  var state = view || loadingView();
+  if (state.hint !== "") return state.hint;
+  if (state.loading === true)
+    return "Middle-click the bar icon, or press r here, to run the fetch.";
+  return FALLBACK_HINT;
+}
+
+function errorCode(view) {
+  var state = view || loadingView();
+  return state.code === "" ? "" : "code: " + state.code;
+}
+
+function emptyCreditsText() {
+  return "No credits on this billing account.";
+}
+
+function footerHints() {
+  // Deliberately terse: this shares one caption row with the refresh and
+  // console buttons inside the panel's contentWidth, and the panel must never
+  // clip a hint mid-word. The Console button beside it names the destination;
+  // `r` and `o` are the panel's own keys (r = refresh, o = console).
+  return "r refresh \u00b7 o console";
+}
+
+// The view caps totals at MAX_TOTALS and credits at MAX_CREDITS. A snapshot
+// that carries more is shown as its first N plus a count of the rest, so a
+// truncated list is never mistaken for the whole account.
+function droppedCreditsNote(view) {
+  var dropped = countOr(view && view.droppedCredits);
+  if (dropped === 0) return "";
+  var shown = isArray(view && view.credits) ? view.credits.length : 0;
+  return "Showing the first " + shown + " of " + (shown + dropped) + " credits";
+}
+
+function droppedTotalsNote(view) {
+  var dropped = countOr(view && view.droppedTotals);
+  if (dropped === 0) return "";
+  var shown = isArray(view && view.totals) ? view.totals.length : 0;
+  return "Showing the first " + shown + " of " + (shown + dropped) + " currencies";
+}
 
 if (typeof module !== "undefined") {
   module.exports = {
@@ -610,5 +797,26 @@ if (typeof module !== "undefined") {
     ageText: ageText,
     tooltip: tooltip,
     statusLine: statusLine,
+    heroMeta: heroMeta,
+    heroDetail: heroDetail,
+    summaryLine: summaryLine,
+    creditTitle: creditTitle,
+    creditStateLabel: creditStateLabel,
+    isSpentState: isSpentState,
+    visibleCredits: visibleCredits,
+    hiddenCreditCount: hiddenCreditCount,
+    hiddenCreditsNote: hiddenCreditsNote,
+    droppedCreditsNote: droppedCreditsNote,
+    droppedTotalsNote: droppedTotalsNote,
+    percentRemaining: percentRemaining,
+    percentText: percentText,
+    remainingText: remainingText,
+    formatDate: formatDate,
+    endText: endText,
+    errorText: errorText,
+    errorHint: errorHint,
+    errorCode: errorCode,
+    emptyCreditsText: emptyCreditsText,
+    footerHints: footerHints,
   };
 }
