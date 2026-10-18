@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "id": "adix.gcp-credits",
+  "name": "GCP Credits",
+  "version": "1.0.0",
+  "author": "adi-IL",
+  "license": "MIT",
+  "description": "Google Cloud credit balances in the Omarchy bar. The billing console exposes issued credits, remaining value and percent remaining through a browser-only private API, so this plugin drives an isolated headless Chromium cloned from your own Chromium profile and shows what the credits page shows.",
+  "keywords": ["gcp", "google-cloud", "billing", "credits", "funds", "budget"],
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "GCP Credits",
+    "description": "Usable Google Cloud credits from the billing console, with a per-credit panel",
+    "category": "Finance",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "intervalSeconds": 900,
+      "format": "compact",
+      "expiredCredits": "Hide",
+      "billingAccount": ""
+    },
+    "schema": [
+      {
+        "key": "intervalSeconds",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 300,
+        "max": 86400,
+        "step": 300,
+        "defaultValue": 900
+      },
+      {
+        "key": "format",
+        "type": "enum",
+        "label": "Amount format",
+        "options": ["compact", "exact"],
+        "defaultValue": "compact",
+        "description": "compact shortens large amounts (INR 12345 becomes 12.3k, USD 1250 becomes 1.25k) so several currencies still fit in the bar. exact always prints the full number."
+      },
+      {
+        "key": "expiredCredits",
+        "type": "enum",
+        "label": "Expired and used credits",
+        "options": ["Hide", "Show"],
+        "defaultValue": "Hide",
+        "description": "Whether the panel lists credits that are expired or fully spent."
+      },
+      {
+        "key": "billingAccount",
+        "type": "string",
+        "label": "Billing account id",
+        "defaultValue": "",
+        "description": "Optional. Defaults to the open billing account from `gcloud billing accounts list`."
+      }
+    ]
+  }
+}
